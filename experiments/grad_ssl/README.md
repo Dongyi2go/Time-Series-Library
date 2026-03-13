@@ -11,8 +11,8 @@ UEA dataset.
 | Step | Script | Description |
 |------|--------|-------------|
 | 1 | `pretrain.py` | Self-supervised masked-autoencoding pre-training (10 epochs) for each of the three backbones |
-| 2 | `extract_features.py` | Extract 128-d gradient features per model → 384-d concatenated features; save to `.npz` |
-| 3 | `train_classifier.py` | Train a small MLP on the gradient features and evaluate on the test set |
+| 2 | `extract_features.py` | Extract 128-d gradient features per model → 384-d concatenated features; save to `.npz` and UEA/UCR `.ts` files |
+| 3 | `train_classifier.py` | Train a downstream classifier (**MLP** or **DLinear**) on the gradient features and evaluate on the test set |
 
 ---
 
@@ -77,8 +77,11 @@ from [HuggingFace](https://huggingface.co/datasets/thuml/Time-Series-Library)
 ## Quick start
 
 ```bash
-# Full pipeline (GPU recommended, falls back to CPU automatically)
+# Full pipeline with default MLP classifier (GPU recommended, falls back to CPU)
 bash experiments/grad_ssl/run_pipeline.sh ./dataset/Heartbeat auto
+
+# Full pipeline with DLinear classifier
+bash experiments/grad_ssl/run_pipeline.sh ./dataset/Heartbeat auto DLinear
 
 # Or step by step:
 
@@ -90,15 +93,69 @@ for MODEL in Informer LightTS TimesNet; do
     --n_epochs  10
 done
 
-# 2. Extract gradient features
+# 2. Extract gradient features (.npz + .ts files)
 python experiments/grad_ssl/extract_features.py \
     --data_path ./dataset/Heartbeat \
     --out_path  ./artifacts/grad_features_heartbeat.npz
 
-# 3. Train downstream classifier
+# 3a. Train downstream MLP classifier (reads .npz)
 python experiments/grad_ssl/train_classifier.py \
-    --npz_path ./artifacts/grad_features_heartbeat.npz
+    --npz_path ./artifacts/grad_features_heartbeat.npz \
+    --model    MLP
+
+# 3b. Train downstream DLinear classifier (reads .ts feature files)
+python experiments/grad_ssl/train_classifier.py \
+    --train_ts_path ./artifacts/grad_features_heartbeat_TRAIN.ts \
+    --test_ts_path  ./artifacts/grad_features_heartbeat_TEST.ts \
+    --model         DLinear
 ```
+
+---
+
+## DLinear Classification
+
+`train_classifier.py` supports a **DLinear** backend in addition to the default MLP.
+DLinear is a lightweight linear model that decomposes the input series into seasonal
+and trend components before classification.  It is particularly effective when the
+gradient-feature channels carry complementary spectral structure across the three
+SSL backbones.
+
+### How it works
+
+* The `.ts` feature files store gradient features in **UEA/UCR multi-channel format**:
+  each sample has `n_models` channels (dimensions) of length `grad_dim` (default 128).
+* `train_classifier.py` parses the `.ts` file into a tensor of shape
+  `[n_samples, series_length, n_channels]` matching DLinear's `[B, T, C]` input.
+* DLinear decomposes each channel with a moving-average filter (`--moving_avg`),
+  applies per-channel linear layers, then projects the flattened output to class logits.
+
+### .ts feature file format
+
+```
+# UEA/UCR .ts – gradient features (Train split)
+@problemName grad_features_heartbeat
+@timeStamps false
+@missing false
+@univariate false
+@dimensions 3
+@equalLength true
+@seriesLength 128
+@classLabel true 0 1
+@data
+0.12,-0.34,...(128 values):0.56,0.78,...:0.11,0.22,...:0
+...
+```
+
+Each row encodes one sample: `dim0_v0,...,v127:dim1_v0,...:...:label`.
+
+### DLinear-specific parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--model` | `MLP` | Classifier backend: `MLP` or `DLinear` |
+| `--train_ts_path` | `None` | Path to TRAIN `.ts` feature file |
+| `--test_ts_path`  | `None` | Path to TEST  `.ts` feature file |
+| `--moving_avg` | `25` | Moving-average kernel size for DLinear decomposition |
 
 ---
 
@@ -126,6 +183,8 @@ python experiments/grad_ssl/train_classifier.py \
 | `artifacts/ckpts/LightTS_ckpt_10ep.pth`  | LightTS checkpoint |
 | `artifacts/ckpts/TimesNet_ckpt_10ep.pth` | TimesNet checkpoint |
 | `artifacts/grad_features_heartbeat.npz`  | `X_train [n,384]`, `y_train`, `X_test [n,384]`, `y_test` |
+| `artifacts/grad_features_heartbeat_TRAIN.ts` | UEA/UCR `.ts` format, `[n_train, 128, 3]` |
+| `artifacts/grad_features_heartbeat_TEST.ts`  | UEA/UCR `.ts` format, `[n_test,  128, 3]` |
 | `artifacts/classifier_results.txt`       | Final accuracy metrics |
 
 ---
@@ -140,3 +199,4 @@ All random operations are seeded:
   `seed_j = base_seed + sample_idx × n_masks + mask_idx`.
 * Train and test masks use different base seeds (`base_seed` and `base_seed + 100000`).
 * DataLoader `shuffle=False` for feature extraction; train DataLoader shuffles during pre-training.
+
