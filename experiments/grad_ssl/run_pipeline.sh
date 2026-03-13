@@ -2,25 +2,38 @@
 # run_pipeline.sh  --  End-to-end self-supervised gradient feature pipeline
 #
 # Usage:
-#   bash experiments/grad_ssl/run_pipeline.sh [DATA_PATH] [DEVICE]
+#   bash experiments/grad_ssl/run_pipeline.sh [DATA_PATH] [DEVICE] [CLASSIFIER]
 #
 # Arguments (positional, optional):
-#   DATA_PATH  Directory that contains Heartbeat_TRAIN.ts and Heartbeat_TEST.ts
-#              Default: ./dataset/Heartbeat
-#   DEVICE     pytorch device string, e.g. "cpu", "cuda", "cuda:0"
-#              Default: auto (GPU if available, else CPU)
+#   DATA_PATH   Directory that contains Heartbeat_TRAIN.ts and Heartbeat_TEST.ts
+#               Default: ./dataset/Heartbeat
+#   DEVICE      pytorch device string, e.g. "cpu", "cuda", "cuda:0"
+#               Default: auto (GPU if available, else CPU)
+#   CLASSIFIER  Downstream classifier backend: "MLP" (default) or "DLinear"
+#               When "DLinear" is chosen, .ts feature files are loaded directly.
 #
 # Prerequisites:
 #   pip install -r requirements.txt
 #   # If data not present locally, huggingface_hub will download automatically.
+#
+# One-liner examples:
+#   # Full pipeline with default MLP classifier
+#   bash experiments/grad_ssl/run_pipeline.sh
+#
+#   # Full pipeline with DLinear classifier (reads .ts feature files)
+#   bash experiments/grad_ssl/run_pipeline.sh ./dataset/Heartbeat auto DLinear
 
 set -euo pipefail
 
 DATA_PATH="${1:-./dataset/Heartbeat}"
 DEVICE="${2:-auto}"
+CLASSIFIER="${3:-MLP}"
 
 CKPT_DIR="./artifacts/ckpts"
 NPZ_PATH="./artifacts/grad_features_heartbeat.npz"
+# .ts feature paths derived automatically from NPZ_PATH (strip .npz, add _TRAIN/TEST.ts)
+TS_TRAIN="${NPZ_PATH%.npz}_TRAIN.ts"
+TS_TEST="${NPZ_PATH%.npz}_TEST.ts"
 
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
 N_EPOCHS=10
@@ -82,19 +95,36 @@ python experiments/grad_ssl/extract_features.py \
 
 echo ""
 echo "========================================================"
-echo " Step 3/3 : Train downstream MLP classifier"
+echo " Step 3/3 : Train downstream ${CLASSIFIER} classifier"
 echo "========================================================"
 
-python experiments/grad_ssl/train_classifier.py \
-    --npz_path    "${NPZ_PATH}" \
-    --hidden      256 \
-    --epochs      200 \
-    --lr          1e-3 \
-    --batch_size  64 \
-    --seed        "${SEED}" \
-    --device      "${DEVICE}"
+if [ "${CLASSIFIER}" = "DLinear" ]; then
+    # DLinear reads the UEA/UCR .ts files produced by extract_features.py
+    python experiments/grad_ssl/train_classifier.py \
+        --train_ts_path "${TS_TRAIN}" \
+        --test_ts_path  "${TS_TEST}" \
+        --model         DLinear \
+        --moving_avg    25 \
+        --epochs        200 \
+        --lr            1e-3 \
+        --batch_size    64 \
+        --seed          "${SEED}" \
+        --device        "${DEVICE}"
+else
+    # Default MLP reads the .npz file
+    python experiments/grad_ssl/train_classifier.py \
+        --npz_path    "${NPZ_PATH}" \
+        --model       MLP \
+        --hidden      256 \
+        --epochs      200 \
+        --lr          1e-3 \
+        --batch_size  64 \
+        --seed        "${SEED}" \
+        --device      "${DEVICE}"
+fi
 
 echo ""
 echo "========================================================"
 echo " Pipeline complete!  Artifacts in ./artifacts/"
 echo "========================================================"
+
