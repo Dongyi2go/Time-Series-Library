@@ -21,11 +21,12 @@ Each sample's 384-d feature = concat([feat_Informer, feat_LightTS, feat_TimesNet
 
 Output
 ------
-artifacts/grad_features_heartbeat.npz
-  X_train : [n_train, 384]
-  y_train : [n_train]
-  X_test  : [n_test,  384]
-  y_test  : [n_test]
+artifacts/grad_features_heartbeat_TRAIN.ts  (UEA/UCR .ts format)
+artifacts/grad_features_heartbeat_TEST.ts   (UEA/UCR .ts format)
+
+  Each file contains n_samples rows.  Each row encodes grad_dim values per
+  model as one UEA dimension, so a 3-model run produces 3 dimensions of
+  length grad_dim (default 128).
 
 Usage
 -----
@@ -168,6 +169,105 @@ def extract_features(
 
 
 # ---------------------------------------------------------------------------
+# UEA/UCR .ts format export
+# ---------------------------------------------------------------------------
+
+def save_gradient_features_ts(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    out_path: str,
+    problem_name: str = "GradientFeature",
+    grad_dim: int = 128,
+) -> None:
+    """Save gradient features as UEA/UCR standard .ts format files.
+
+    The concatenated feature matrix X (shape [n_samples, grad_dim * n_models])
+    is reshaped to [n_samples, grad_dim, n_models] so that each model's
+    contribution becomes one UEA dimension of length grad_dim.
+
+    Two files are written, derived from ``out_path``:
+      <base>_TRAIN.ts  – training split
+      <base>_TEST.ts   – test split
+
+    Header fields written per UEA/UCR convention:
+      @problemName, @timeStamps, @missing, @univariate,
+      @dimensions, @equalLength, @seriesLength, @classLabel
+
+    Parameters
+    ----------
+    X_train, X_test : np.ndarray  shape [n_samples, grad_dim * n_models]
+    y_train, y_test : np.ndarray  shape [n_samples]
+    out_path        : str  base path used to derive output filenames;
+                      a trailing ``.npz`` extension is stripped automatically.
+    problem_name    : str  written into the @problemName header field.
+    grad_dim        : int  feature length contributed by each model (default 128).
+    """
+    n_train, total_dim = X_train.shape
+    if total_dim % grad_dim != 0:
+        raise ValueError(
+            f"Total feature dim ({total_dim}) is not divisible by "
+            f"grad_dim ({grad_dim}). Check extraction parameters."
+        )
+    n_models = total_dim // grad_dim  # number of UEA dimensions
+
+    # Validate X_test has the same feature width as X_train
+    if X_test.shape[1] != total_dim:
+        raise ValueError(
+            f"X_test feature dim ({X_test.shape[1]}) does not match "
+            f"X_train feature dim ({total_dim})."
+        )
+
+    # Reshape: [n_samples, grad_dim * n_models] → [n_samples, grad_dim, n_models]
+    X_train_3d = X_train.reshape(n_train, grad_dim, n_models)
+    X_test_3d  = X_test.reshape(X_test.shape[0], grad_dim, n_models)
+
+    # Derive output paths from out_path (strip .npz suffix when present)
+    base = out_path[:-4] if out_path.endswith(".npz") else out_path
+    out_train = base + "_TRAIN.ts"
+    out_test  = base + "_TEST.ts"
+
+    # Collect all class labels across both splits for the header.
+    # Labels are expected to be numeric (integers); non-numeric labels will
+    # raise a ValueError at write time.
+    all_labels = sorted(set(y_train.tolist()) | set(y_test.tolist()))
+    label_desc = " ".join(str(int(lbl)) for lbl in all_labels)
+
+    # @univariate is true only when a single model/dimension is present
+    univariate_flag = "true" if n_models == 1 else "false"
+
+    def _write_split(X_3d: np.ndarray, y: np.ndarray, path: str, split: str) -> None:
+        """Write a single split to UEA/UCR .ts format."""
+        n, series_len, dims = X_3d.shape  # series_len == grad_dim, dims == n_models
+        with open(path, "w", encoding="utf-8") as fh:
+            # ---- Header ----
+            fh.write(f"# UEA/UCR .ts – gradient features ({split} split)\n")
+            fh.write(f"@problemName {problem_name}\n")
+            fh.write("@timeStamps false\n")
+            fh.write("@missing false\n")
+            fh.write(f"@univariate {univariate_flag}\n")
+            fh.write(f"@dimensions {dims}\n")
+            fh.write("@equalLength true\n")
+            fh.write(f"@seriesLength {series_len}\n")
+            fh.write(f"@classLabel true {label_desc}\n")
+            fh.write("@data\n")
+            # ---- Data rows: one sample per line ----
+            for i in range(n):
+                # Each model's 128-d vector is one colon-separated dimension
+                dim_strs = [
+                    ",".join(f"{v:.6g}" for v in X_3d[i, :, d])
+                    for d in range(dims)
+                ]
+                row = ":".join(dim_strs) + f":{int(y[i])}"
+                fh.write(row + "\n")
+        print(f"{split} features saved → {path}")
+
+    _write_split(X_train_3d, y_train, out_train, "Train")
+    _write_split(X_test_3d,  y_test,  out_test,  "Test")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -276,12 +376,16 @@ def main():
     assert X_train.shape[1] == args.grad_dim * len(model_names), \
         f"Expected {args.grad_dim * len(model_names)} features, got {X_train.shape[1]}"
 
-    # ---- Save ----
+    # ---- Save as UEA/UCR .ts format ----
     os.makedirs(os.path.dirname(os.path.abspath(args.out_path)), exist_ok=True)
-    np.savez(args.out_path,
-             X_train=X_train, y_train=y_train,
-             X_test=X_test,   y_test=y_test)
-    print(f"\nSaved → {args.out_path}")
+    # Derive problem name from the output filename (without extension)
+    problem_name = os.path.splitext(os.path.basename(args.out_path))[0]
+    save_gradient_features_ts(
+        X_train, y_train, X_test, y_test,
+        out_path=args.out_path,
+        problem_name=problem_name,
+        grad_dim=args.grad_dim,
+    )
 
 
 if __name__ == "__main__":
